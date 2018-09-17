@@ -142,10 +142,10 @@ Perform the following procedure to create a local copy of the *Demo* connector s
     user@devsystem$ cp $PXFDEV_BASE/incubator-hawq/pxf/pxf-api/src/main/java/org/apache/hawq/pxf/api/examples/* .
     ```
 
-5. The original PXF *Demo* connector resides in the `org.apache.hawq.pxf.api.examples` package. Your *Demo* connector resides in a package named `org.greenplum.pxf.example.demo`. Update the package name in your local copy of the *Demo* connector source code. You can edit the files, run a script, etc. For example:
+5. The original PXF *Demo* connector resides in the `org.greenplum.pxf.api.examples` package. Your *Demo* connector resides in a package named `org.greenplum.pxf.example.demo`. Update the package name in your local copy of the *Demo* connector source code. You can edit the files, run a script, etc. For example:
 
     ``` shell
-    user@devsystem$ sed -i.bak s/"org.apache.hawq.pxf.api.examples"/"org.greenplum.pxf.example.demo"/g *.java
+    user@devsystem$ sed -i.bak s/"org.greenplum.pxf.api.examples"/"org.greenplum.pxf.example.demo"/g *.java
     ```
 
     The `sed` command above creates a backup of each file. Remove the backup files. For example:

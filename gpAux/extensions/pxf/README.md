@@ -62,9 +62,9 @@ static data from the PXF agents themselves.
 ```
 # CREATE EXTERNAL TABLE pxf_read_test (a TEXT, b TEXT, c TEXT) \
 LOCATION ('pxf://localhost:5888/tmp/dummy1' \
-'?FRAGMENTER=org.apache.hawq.pxf.api.examples.DemoFragmenter' \
-'&ACCESSOR=org.apache.hawq.pxf.api.examples.DemoAccessor' \
-'&RESOLVER=org.apache.hawq.pxf.api.examples.DemoTextResolver') \
+'?FRAGMENTER=org.greenplum.pxf.api.examples.DemoFragmenter' \
+'&ACCESSOR=org.greenplum.pxf.api.examples.DemoAccessor' \
+'&RESOLVER=org.greenplum.pxf.api.examples.DemoTextResolver') \
 FORMAT 'TEXT' (DELIMITER ',');
 ```
 
