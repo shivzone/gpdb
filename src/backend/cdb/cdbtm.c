@@ -576,6 +576,13 @@ doNotifyingCommitPrepared(void)
 	SIMPLE_FAULT_INJECTOR("dtm_broadcast_commit_prepared");
 	savedInterruptHoldoffCount = InterruptHoldoffCount;
 
+	/*
+	 * Acquire TwophaseCommitLock in shared mode to block any GPDB restore
+	 * points from being created while commit prepared messages are being
+	 * broadcasted.
+	 */
+	LWLockAcquire(TwophaseCommitLock, LW_SHARED);
+
 	Assert(MyTmGxactLocal->twophaseSegments != NIL);
 	PG_TRY();
 	{
@@ -661,6 +668,13 @@ doNotifyingCommitPrepared(void)
 			TM_ERRDETAIL));
 
 	doInsertForgetCommitted();
+
+	/*
+	 * We release the TwophaseCommitLock only after writing our distributed
+	 * forget record which signifies that all query executors have written
+	 * their commit prepared records.
+	 */
+	LWLockRelease(TwophaseCommitLock);
 }
 
 static void
