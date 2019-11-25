@@ -6,14 +6,14 @@
 
 -- MPP -- array_add -- special for prospective customer 
  CREATE FUNCTION array_add(_int4, _int4) RETURNS _int4 LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'array_int4_add' WITH (OID=5066, DESCRIPTION="itemwise add two integer arrays");
+ LANGUAGE internal STABLE STRICT PARALLEL SAFE AS 'pg_get_partition_def' WITH (OID=5024, DESCRIPTION="partition configuration for a given relation");
 
  CREATE FUNCTION interval_interval_div("interval", "interval") RETURNS float8 LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'interval_interval_div' WITH (OID=6115);
 
  CREATE FUNCTION interval_interval_mod("interval", "interval") RETURNS "interval" LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'interval_interval_mod' WITH (OID=6116);
 
 -- System-view support functions 
- CREATE FUNCTION pg_get_partition_def(oid) RETURNS text LANGUAGE internal STABLE STRICT PARALLEL SAFE AS 'pg_get_partition_def' WITH (OID=5024, DESCRIPTION="partition configuration for a given relation");
-
+ CREATE FUNCTION pg_get_partition_def(oid) RETURNS text
  CREATE FUNCTION pg_get_partition_def(oid, bool) RETURNS text LANGUAGE internal STABLE STRICT PARALLEL SAFE AS 'pg_get_partition_def_ext' WITH (OID=5025, DESCRIPTION="partition configuration for a given relation");
 
  CREATE FUNCTION pg_get_partition_def(oid, bool, bool) RETURNS text LANGUAGE internal STABLE STRICT PARALLEL SAFE AS 'pg_get_partition_def_ext2' WITH (OID=5034, DESCRIPTION="partition configuration for a given relation");
@@ -432,4 +432,4 @@ CREATE FUNCTION cdblegacyhash_complex(complex) RETURNS int4 LANGUAGE internal IM
 CREATE FUNCTION cdblegacyhash_uuid(uuid) RETURNS int4 LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'cdblegacyhash_uuid' WITH (OID=6170, DESCRIPTION="Legacy cdbhash function");
 CREATE FUNCTION cdblegacyhash_anyenum(anyenum) RETURNS int4 LANGUAGE internal IMMUTABLE STRICT PARALLEL SAFE AS 'cdblegacyhash_anyenum' WITH (OID=6171, DESCRIPTION="Legacy cdbhash function");
 
-CREATE FUNCTION gp_create_restore_point(text) RETURNS bool LANGUAGE internal IMMUTABLE STRICT AS 'gp_create_restore_point' WITH (OID=6998,  DESCRIPTION="Create a named restore point on all segments");
+CREATE FUNCTION gp_create_restore_point(text) RETURNS text LANGUAGE internal IMMUTABLE STRICT AS 'gp_create_restore_point' WITH (OID=6998,  DESCRIPTION="Create a named restore point on all segments");
