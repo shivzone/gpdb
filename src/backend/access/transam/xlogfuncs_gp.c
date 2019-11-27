@@ -72,18 +72,21 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 		context = (Context *) palloc(sizeof(Context));
 		context->cdb_pgresults.pg_results =
 			(struct pg_result **) palloc(getgpsegmentCount() * sizeof(struct pg_result *));
-		context->index = -1;
+		context->index = 0;
 		funcctx->user_fctx = (void *) context;
 
 		if (!IS_QUERY_DISPATCHER())
 			elog(ERROR,
 				 "cannot use gp_create_restore_point() when not in QD mode");
 
+		/* TODO: This needs to be revsited
+		 * Temporary hack to fetch segment ID with the restore command
+		 * This allows us to directly use pg_create_restore_point within segments
+		 */
 		restore_name_str = text_to_cstring(restore_name);
 		restore_command =
-			psprintf("SELECT pg_catalog.pg_create_restore_point(%s)",
+			psprintf("SELECT gp_segment_id, pg_catalog.pg_create_restore_point(%s) FROM select pg_catalog.pg_database LIMIT 1",
 					 quote_literal_cstr(restore_name_str));
-
 
 		/*
 		 * Acquire TwophaseCommitLock in EXCLUSIVE mode. This is to ensure
@@ -115,22 +118,26 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 	funcctx = SRF_PERCALL_SETUP();
 	context = (Context *) funcctx->user_fctx;
 
-	while (context->index < context->cdb_pgresults.numResults)
+	while (context->index <= context->cdb_pgresults.numResults)
 	{
 		Datum		values[2];
 		bool		nulls[2];
 		HeapTuple	tuple;
 		Datum		result;
 		char	   *lsn_value;
+		int 		seg_index;
 
-		if (context->index == MASTER_CONTENT_ID)
+		if (context->index == 0)
 		{
+			// Setting fields representing QD's restore point
+			seg_index = GpIdentity.segindex;
 			lsn_value = psprintf("%X/%X",
 								 (uint32) (context->qd_restorepoint_lsn >> 32), (uint32) context->qd_restorepoint_lsn);
 		}
 		else
 		{
-			struct pg_result *pgresult = context->cdb_pgresults.pg_results[context->index];
+			// Setting fields representing QE's restore point
+			struct pg_result *pgresult = context->cdb_pgresults.pg_results[context->index-1];
 			ExecStatusType resultStatus = PQresultStatus(pgresult);
 
 			if (resultStatus != PGRES_COMMAND_OK && resultStatus != PGRES_TUPLES_OK)
@@ -138,7 +145,9 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 						 (errmsg("could not get the restore point from segment"),
 						  errdetail("%s", PQresultErrorMessage(pgresult)))));
-			lsn_value = PQgetvalue(pgresult, 0, 0);
+			Assert(PQntuples(pgresult) == 2);
+			seg_index = atoi(PQgetvalue(pgresult, 0, 0));
+			lsn_value = PQgetvalue(pgresult, 0, 1);
 		}
 
 		/*
@@ -147,8 +156,7 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, false, sizeof(nulls));
 
-		/* TODO: Use segment ID later */
-		values[0] = Int16GetDatum(context->index);
+		values[0] = Int16GetDatum(seg_index);
 		values[1] = CStringGetDatum(lsn_value);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
