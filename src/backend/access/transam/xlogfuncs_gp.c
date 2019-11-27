@@ -39,7 +39,9 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 	typedef struct Context
 	{
 		CdbPgResults cdb_pgresults;
-		XLogRecPtr	qd_restorepoint_lsn;
+		XLogRecPtr	restorepoint_lsn;
+		int seg_index;
+		
 		int			index;
 	}			Context;
 
@@ -72,40 +74,40 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 		context = (Context *) palloc(sizeof(Context));
 		context->cdb_pgresults.pg_results =
 			(struct pg_result **) palloc(getgpsegmentCount() * sizeof(struct pg_result *));
-		context->index = 0;
+		context->seg_index = GpIdentity.segindex;
 		funcctx->user_fctx = (void *) context;
 
-		if (!IS_QUERY_DISPATCHER())
-			elog(ERROR,
-				 "cannot use gp_create_restore_point() when not in QD mode");
+		if (IS_QUERY_DISPATCHER())
+		{
+			restore_name_str = text_to_cstring(restore_name);
+			restore_command =
+				psprintf("SELECT segment_id, restore_lsn from pg_catalog.gp_create_restore_point(%s)",
+						 quote_literal_cstr(restore_name_str));
 
-		/* TODO: This needs to be revsited
-		 * Temporary hack to fetch segment ID with the restore command
-		 * This allows us to directly use pg_create_restore_point within segments
-		 */
-		restore_name_str = text_to_cstring(restore_name);
-		restore_command =
-			psprintf("SELECT gp_segment_id, pg_catalog.pg_create_restore_point(%s) FROM select pg_catalog.pg_database LIMIT 1",
-					 quote_literal_cstr(restore_name_str));
+			/*
+			 * Acquire TwophaseCommitLock in EXCLUSIVE mode. This is to ensure
+			 * cluster-wide restore point consistency by blocking distributed
+			 * commit prepared broadcasts from concurrent twophase transactions
+			 * where a QE segment has written WAL.
+			 */
+			LWLockAcquire(TwophaseCommitLock, LW_EXCLUSIVE);
 
-		/*
-		 * Acquire TwophaseCommitLock in EXCLUSIVE mode. This is to ensure
-		 * cluster-wide restore point consistency by blocking distributed
-		 * commit prepared broadcasts from concurrent twophase transactions
-		 * where a QE segment has written WAL.
-		 */
-		LWLockAcquire(TwophaseCommitLock, LW_EXCLUSIVE);
-
-		SIMPLE_FAULT_INJECTOR("gp_create_restore_point_acquired_lock");
-
-		CdbDispatchCommand(restore_command,
-						   DF_NEED_TWO_PHASE | DF_CANCEL_ON_ERROR,
-						   &context->cdb_pgresults);
-		context->qd_restorepoint_lsn = DirectFunctionCall1(pg_create_restore_point,
-														   PointerGetDatum(restore_name));
-		LWLockRelease(TwophaseCommitLock);
-
-		pfree(restore_command);
+			SIMPLE_FAULT_INJECTOR("gp_create_restore_point_acquired_lock");
+			CdbDispatchCommand(restore_command,
+							   DF_NEED_TWO_PHASE | DF_CANCEL_ON_ERROR,
+							   &context->cdb_pgresults);
+			context->restorepoint_lsn = DirectFunctionCall1(pg_create_restore_point,
+															   PointerGetDatum(restore_name));
+			context->seg_index = GpIdentity.segindex;
+			LWLockRelease(TwophaseCommitLock);
+			pfree(restore_command);
+		}
+		else
+		{
+			context->restorepoint_lsn = DirectFunctionCall1(pg_create_restore_point,
+															   PointerGetDatum(restore_name));
+			context->seg_index = GpIdentity.segindex;
+		}
 
 		funcctx->user_fctx = (void *) context;
 		MemoryContextSwitchTo(oldcontext);
@@ -118,7 +120,7 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 	funcctx = SRF_PERCALL_SETUP();
 	context = (Context *) funcctx->user_fctx;
 
-	while (context->index <= context->cdb_pgresults.numResults)
+	while (true)
 	{
 		Datum		values[2];
 		bool		nulls[2];
@@ -127,16 +129,18 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 		char	   *lsn_value;
 		int 		seg_index;
 
+		if( (context->seg_index == MASTER_CONTENT_ID && context->index > context->cdb_pgresults.numResults) ||
+			(context->seg_index != MASTER_CONTENT_ID && context->index > 0) )
+			break;
+
 		if (context->index == 0)
 		{
-			// Setting fields representing QD's restore point
-			seg_index = GpIdentity.segindex;
+			seg_index = context->seg_index;
 			lsn_value = psprintf("%X/%X",
-								 (uint32) (context->qd_restorepoint_lsn >> 32), (uint32) context->qd_restorepoint_lsn);
+								 (uint32) (context->restorepoint_lsn >> 32), (uint32) context->restorepoint_lsn);
 		}
 		else
 		{
-			// Setting fields representing QE's restore point
 			struct pg_result *pgresult = context->cdb_pgresults.pg_results[context->index-1];
 			ExecStatusType resultStatus = PQresultStatus(pgresult);
 
@@ -146,24 +150,22 @@ gp_create_restore_point(PG_FUNCTION_ARGS)
 						 (errmsg("could not get the restore point from segment"),
 						  errdetail("%s", PQresultErrorMessage(pgresult)))));
 			Assert(PQntuples(pgresult) == 2);
-			seg_index = atoi(PQgetvalue(pgresult, 0, 0));
+			seg_index = PQgetvalue(pgresult, 0, 0);
 			lsn_value = PQgetvalue(pgresult, 0, 1);
 		}
-
 		/*
 		 * Form tuple with appropriate data.
 		 */
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, false, sizeof(nulls));
-
 		values[0] = Int16GetDatum(seg_index);
 		values[1] = CStringGetDatum(lsn_value);
-
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		result = HeapTupleGetDatum(tuple);
 
 		context->index++;
 		SRF_RETURN_NEXT(funcctx, result);
+
 	}
 
 	SRF_RETURN_DONE(funcctx);
