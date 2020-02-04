@@ -30,6 +30,7 @@
 
 /* fd and filename for currently open WAL file */
 static int	walfile = -1;
+static char mypipename[12] = "/tmp/myfifo";
 static char current_walfile_name[MAXPGPATH] = "";
 static bool reportFlushPosition = false;
 static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
@@ -87,94 +88,6 @@ mark_file_as_archived(const char *basedir, const char *fname)
 }
 
 /*
- * Open a new WAL file in the specified directory.
- *
- * The file will be padded to 16Mb with zeroes. The base filename (without
- * partial_suffix) is stored in current_walfile_name.
- */
-static bool
-open_walfile(StreamCtl *stream, XLogRecPtr startpoint)
-{
-	int			f;
-	char		fn[MAXPGPATH];
-	struct stat statbuf;
-	PGAlignedXLogBlock zerobuf;
-	int			bytes;
-	XLogSegNo	segno;
-
-	XLByteToSeg(startpoint, segno);
-	XLogFileName(current_walfile_name, stream->timeline, segno);
-
-	snprintf(fn, sizeof(fn), "%s/%s%s", stream->basedir, current_walfile_name,
-			 stream->partial_suffix ? stream->partial_suffix : "");
-	f = open(fn, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
-	if (f == -1)
-	{
-		fprintf(stderr,
-				_("%s: could not open transaction log file \"%s\": %s\n"),
-				progname, fn, strerror(errno));
-		return false;
-	}
-
-	/*
-	 * Verify that the file is either empty (just created), or a complete
-	 * XLogSegSize segment. Anything in between indicates a corrupt file.
-	 */
-	if (fstat(f, &statbuf) != 0)
-	{
-		fprintf(stderr,
-				_("%s: could not stat transaction log file \"%s\": %s\n"),
-				progname, fn, strerror(errno));
-		close(f);
-		return false;
-	}
-	if (statbuf.st_size == XLogSegSize)
-	{
-		/* File is open and ready to use */
-		walfile = f;
-		return true;
-	}
-	if (statbuf.st_size != 0)
-	{
-		fprintf(stderr,
-				_("%s: transaction log file \"%s\" has %d bytes, should be 0 or %d\n"),
-				progname, fn, (int) statbuf.st_size, XLogSegSize);
-		close(f);
-		return false;
-	}
-
-	/* New, empty, file. So pad it to 16Mb with zeroes */
-	memset(zerobuf.data, 0, XLOG_BLCKSZ);
-	for (bytes = 0; bytes < XLogSegSize; bytes += XLOG_BLCKSZ)
-	{
-		errno = 0;
-		if (write(f, zerobuf.data, XLOG_BLCKSZ) != XLOG_BLCKSZ)
-		{
-			/* if write didn't set errno, assume problem is no disk space */
-			if (errno == 0)
-				errno = ENOSPC;
-			fprintf(stderr,
-					_("%s: could not pad transaction log file \"%s\": %s\n"),
-					progname, fn, strerror(errno));
-			close(f);
-			unlink(fn);
-			return false;
-		}
-	}
-
-	if (lseek(f, SEEK_SET, 0) != 0)
-	{
-		fprintf(stderr,
-				_("%s: could not seek to beginning of transaction log file \"%s\": %s\n"),
-				progname, fn, strerror(errno));
-		close(f);
-		return false;
-	}
-	walfile = f;
-	return true;
-}
-
-/*
  * Close the current WAL file (if open), and rename it to the correct
  * filename if it's complete. On failure, prints an error message to stderr
  * and returns false, otherwise returns true.
@@ -187,22 +100,6 @@ close_walfile(StreamCtl *stream, XLogRecPtr pos)
 	if (walfile == -1)
 		return true;
 
-	currpos = lseek(walfile, 0, SEEK_CUR);
-	if (currpos == -1)
-	{
-		fprintf(stderr,
-			 _("%s: could not determine seek position in file \"%s\": %s\n"),
-				progname, current_walfile_name, strerror(errno));
-		return false;
-	}
-
-	if (fsync(walfile) != 0)
-	{
-		fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
-				progname, current_walfile_name, strerror(errno));
-		return false;
-	}
-
 	if (close(walfile) != 0)
 	{
 		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
@@ -211,41 +108,6 @@ close_walfile(StreamCtl *stream, XLogRecPtr pos)
 		return false;
 	}
 	walfile = -1;
-
-	/*
-	 * If we finished writing a .partial file, rename it into place.
-	 */
-	if (currpos == XLOG_SEG_SIZE && stream->partial_suffix)
-	{
-		char		oldfn[MAXPGPATH];
-		char		newfn[MAXPGPATH];
-
-		snprintf(oldfn, sizeof(oldfn), "%s/%s%s", stream->basedir, current_walfile_name, stream->partial_suffix);
-		snprintf(newfn, sizeof(newfn), "%s/%s", stream->basedir, current_walfile_name);
-		if (rename(oldfn, newfn) != 0)
-		{
-			fprintf(stderr, _("%s: could not rename file \"%s\": %s\n"),
-					progname, current_walfile_name, strerror(errno));
-			return false;
-		}
-	}
-	else if (stream->partial_suffix)
-		fprintf(stderr,
-				_("%s: not renaming \"%s%s\", segment is not complete\n"),
-				progname, current_walfile_name, stream->partial_suffix);
-
-	/*
-	 * Mark file as archived if requested by the caller - pg_basebackup needs
-	 * to do so as files can otherwise get archived again after promotion of a
-	 * new node. This is in line with walreceiver.c always doing a
-	 * XLogArchiveForceDone() after a complete segment.
-	 */
-	if (currpos == XLOG_SEG_SIZE && stream->mark_done)
-	{
-		/* writes error message if failed */
-		if (!mark_file_as_archived(stream->basedir, current_walfile_name))
-			return false;
-	}
 
 	lastFlushPosition = pos;
 	return true;
@@ -581,43 +443,46 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	 */
 	lastFlushPosition = stream->startpos;
 
+	// Creating the named file(FIFO)
+	mkfifo(mypipename, 0666);
+
 	while (1)
 	{
-		/*
-		 * Fetch the timeline history file for this timeline, if we don't have
-		 * it already.
-		 */
-		if (!existsTimeLineHistoryFile(stream))
-		{
-			snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", stream->timeline);
-			res = PQexec(conn, query);
-			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-			{
-				/* FIXME: we might send it ok, but get an error */
-				fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
-					progname, "TIMELINE_HISTORY", PQresultErrorMessage(res));
-				PQclear(res);
-				return false;
-			}
-
-			/*
-			 * The response to TIMELINE_HISTORY is a single row result set
-			 * with two fields: filename and content
-			 */
-			if (PQnfields(res) != 2 || PQntuples(res) != 1)
-			{
-				fprintf(stderr,
-						_("%s: unexpected response to TIMELINE_HISTORY command: got %d rows and %d fields, expected %d rows and %d fields\n"),
-						progname, PQntuples(res), PQnfields(res), 1, 2);
-			}
-
-			/* Write the history file to disk */
-			writeTimeLineHistoryFile(stream,
-									 PQgetvalue(res, 0, 0),
-									 PQgetvalue(res, 0, 1));
-
-			PQclear(res);
-		}
+//		/*
+//		 * Fetch the timeline history file for this timeline, if we don't have
+//		 * it already.
+//		 */
+//		if (!existsTimeLineHistoryFile(stream))
+//		{
+//			snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", stream->timeline);
+//			res = PQexec(conn, query);
+//			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+//			{
+//				/* FIXME: we might send it ok, but get an error */
+//				fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
+//					progname, "TIMELINE_HISTORY", PQresultErrorMessage(res));
+//				PQclear(res);
+//				return false;
+//			}
+//
+//			/*
+//			 * The response to TIMELINE_HISTORY is a single row result set
+//			 * with two fields: filename and content
+//			 */
+//			if (PQnfields(res) != 2 || PQntuples(res) != 1)
+//			{
+//				fprintf(stderr,
+//						_("%s: unexpected response to TIMELINE_HISTORY command: got %d rows and %d fields, expected %d rows and %d fields\n"),
+//						progname, PQntuples(res), PQnfields(res), 1, 2);
+//			}
+//
+//			/* Write the history file to disk */
+//			writeTimeLineHistoryFile(stream,
+//									 PQgetvalue(res, 0, 0),
+//									 PQgetvalue(res, 0, 1));
+//
+//			PQclear(res);
+//		}
 
 		/*
 		 * Before we start streaming from the requested location, check if the
@@ -1101,7 +966,7 @@ static bool
 ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 				   XLogRecPtr *blockpos)
 {
-	int			xlogoff;
+//	int			xlogoff;
 	int			bytes_left;
 	int			bytes_written;
 	int			hdr_len;
@@ -1131,35 +996,35 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	*blockpos = fe_recvint64(&copybuf[1]);
 
 	/* Extract WAL location for this block */
-	xlogoff = *blockpos % XLOG_SEG_SIZE;
+//	xlogoff = *blockpos % XLOG_SEG_SIZE;
 
 	/*
 	 * Verify that the initial location in the stream matches where we think
 	 * we are.
 	 */
-	if (walfile == -1)
-	{
-		/* No file open yet */
-		if (xlogoff != 0)
-		{
-			fprintf(stderr,
-					_("%s: received transaction log record for offset %u with no file open\n"),
-					progname, xlogoff);
-			return false;
-		}
-	}
-	else
-	{
-		/* More data in existing segment */
-		/* XXX: store seek value don't reseek all the time */
-		if (lseek(walfile, 0, SEEK_CUR) != xlogoff)
-		{
-			fprintf(stderr,
-					_("%s: got WAL data offset %08x, expected %08x\n"),
-					progname, xlogoff, (int) lseek(walfile, 0, SEEK_CUR));
-			return false;
-		}
-	}
+//	if (walfile == -1)
+//	{
+//		/* No file open yet */
+//		if (xlogoff != 0)
+//		{
+//			fprintf(stderr,
+//					_("%s: received transaction log record for offset %u with no file open\n"),
+//					progname, xlogoff);
+//			return false;
+//		}
+//	}
+//	else
+//	{
+//		/* More data in existing segment */
+//		/* XXX: store seek value don't reseek all the time */
+//		if (lseek(walfile, 0, SEEK_CUR) != xlogoff)
+//		{
+//			fprintf(stderr,
+//					_("%s: got WAL data offset %08x, expected %08x\n"),
+//					progname, xlogoff, (int) lseek(walfile, 0, SEEK_CUR));
+//			return false;
+//		}
+//	}
 
 	bytes_left = len - hdr_len;
 	bytes_written = 0;
@@ -1172,19 +1037,25 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		 * If crossing a WAL boundary, only write up until we reach
 		 * XLOG_SEG_SIZE.
 		 */
-		if (xlogoff + bytes_left > XLOG_SEG_SIZE)
-			bytes_to_write = XLOG_SEG_SIZE - xlogoff;
-		else
+//		if (xlogoff + bytes_left > XLOG_SEG_SIZE)
+//			bytes_to_write = XLOG_SEG_SIZE - xlogoff;
+//		else
 			bytes_to_write = bytes_left;
 
 		if (walfile == -1)
 		{
-			if (!open_walfile(stream, *blockpos))
-			{
-				/* Error logged by open_walfile */
-				return false;
-			}
+//			if (!open_walfile(stream, *blockpos))
+//			{
+//				/* Error logged by open_walfile */
+//				return false;
+//			}
+//			walfile = open(mypipename, O_WRONLY);
+			walfile = open(mypipename, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
 		}
+
+		fprintf(stderr,
+		        _("%s: wrote %u bytes to WAL file \"%s\"\n"),
+		        progname, bytes_to_write, mypipename);
 
 		if (write(walfile,
 				  copybuf + hdr_len + bytes_written,
@@ -1201,17 +1072,10 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		bytes_written += bytes_to_write;
 		bytes_left -= bytes_to_write;
 		*blockpos += bytes_to_write;
-		xlogoff += bytes_to_write;
 
 		/* Did we reach the end of a WAL segment? */
 		if (*blockpos % XLOG_SEG_SIZE == 0)
 		{
-			if (!close_walfile(stream, *blockpos))
-				/* Error message written in close_walfile() */
-				return false;
-
-			xlogoff = 0;
-
 			if (still_sending && stream->stream_stop(*blockpos, stream->timeline, true))
 			{
 				if (PQputCopyEnd(conn, NULL) <= 0 || PQflush(conn))

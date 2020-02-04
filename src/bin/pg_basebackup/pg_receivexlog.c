@@ -174,100 +174,7 @@ close_destination_dir(DIR *dest_dir, char *dest_folder)
 static XLogRecPtr
 FindStreamingStart(uint32 *tli)
 {
-	DIR		   *dir;
-	struct dirent *dirent;
-	XLogSegNo	high_segno = 0;
-	uint32		high_tli = 0;
-	bool		high_ispartial = false;
-
-	dir = get_destination_dir(basedir);
-
-	while (errno = 0, (dirent = readdir(dir)) != NULL)
-	{
-		uint32		tli;
-		XLogSegNo	segno;
-		bool		ispartial;
-
-		/*
-		 * Check if the filename looks like an xlog file, or a .partial file.
-		 */
-		if (IsXLogFileName(dirent->d_name))
-			ispartial = false;
-		else if (IsPartialXLogFileName(dirent->d_name))
-			ispartial = true;
-		else
-			continue;
-
-		/*
-		 * Looks like an xlog file. Parse its position.
-		 */
-		XLogFromFileName(dirent->d_name, &tli, &segno);
-
-		/*
-		 * Check that the segment has the right size, if it's supposed to be
-		 * completed.
-		 */
-		if (!ispartial)
-		{
-			struct stat statbuf;
-			char		fullpath[MAXPGPATH * 2];
-
-			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
-			if (stat(fullpath, &statbuf) != 0)
-			{
-				fprintf(stderr, _("%s: could not stat file \"%s\": %s\n"),
-						progname, fullpath, strerror(errno));
-				disconnect_and_exit(1);
-			}
-
-			if (statbuf.st_size != XLOG_SEG_SIZE)
-			{
-				fprintf(stderr,
-						_("%s: segment file \"%s\" has incorrect size %d, skipping\n"),
-						progname, dirent->d_name, (int) statbuf.st_size);
-				continue;
-			}
-		}
-
-		/* Looks like a valid segment. Remember that we saw it. */
-		if ((segno > high_segno) ||
-			(segno == high_segno && tli > high_tli) ||
-			(segno == high_segno && tli == high_tli && high_ispartial && !ispartial))
-		{
-			high_segno = segno;
-			high_tli = tli;
-			high_ispartial = ispartial;
-		}
-	}
-
-	if (errno)
-	{
-		fprintf(stderr, _("%s: could not read directory \"%s\": %s\n"),
-				progname, basedir, strerror(errno));
-		disconnect_and_exit(1);
-	}
-
-	close_destination_dir(dir, basedir);
-
-	if (high_segno > 0)
-	{
-		XLogRecPtr	high_ptr;
-
-		/*
-		 * Move the starting pointer to the start of the next segment, if the
-		 * highest one we saw was completed. Otherwise start streaming from
-		 * the beginning of the .partial segment.
-		 */
-		if (!high_ispartial)
-			high_segno++;
-
-		XLogSegNoOffsetToRecPtr(high_segno, 0, high_ptr);
-
-		*tli = high_tli;
-		return high_ptr;
-	}
-	else
-		return InvalidXLogRecPtr;
+	return InvalidXLogRecPtr;
 }
 
 /*
@@ -511,26 +418,6 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	/*
-	 * Required arguments
-	 */
-	if (basedir == NULL && !do_drop_slot && !do_create_slot)
-	{
-		fprintf(stderr, _("%s: no target directory specified\n"), progname);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
-		exit(1);
-	}
-
-	/*
-	 * Check existence of destination folder.
-	 */
-	if (!do_drop_slot && !do_create_slot)
-	{
-		DIR		   *dir = get_destination_dir(basedir);
-
-		close_destination_dir(dir, basedir);
-	}
 
 #ifndef WIN32
 	pqsignal(SIGINT, sigint_handler);
