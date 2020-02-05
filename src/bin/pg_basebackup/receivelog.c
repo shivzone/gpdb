@@ -32,6 +32,8 @@
 static int	walfile = -1;
 static char mypipename[12] = "/tmp/myfifo";
 static char current_walfile_name[MAXPGPATH] = "";
+static FILE *lsnfile = NULL;
+static char lsnfile_name[13] = "/tmp/lastLSN";
 static bool reportFlushPosition = false;
 static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
 
@@ -55,38 +57,6 @@ static long CalculateCopyStreamSleeptime(int64 now, int standby_message_timeout,
 static bool ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos,
 						 uint32 *timeline);
 
-static bool
-mark_file_as_archived(const char *basedir, const char *fname)
-{
-	int			fd;
-	static char tmppath[MAXPGPATH];
-
-	snprintf(tmppath, sizeof(tmppath), "%s/archive_status/%s.done",
-			 basedir, fname);
-
-	fd = open(tmppath, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
-	if (fd < 0)
-	{
-		fprintf(stderr, _("%s: could not create archive status file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-		return false;
-	}
-
-	if (fsync(fd) != 0)
-	{
-		fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-
-		close(fd);
-
-		return false;
-	}
-
-	close(fd);
-
-	return true;
-}
-
 /*
  * Close the current WAL file (if open), and rename it to the correct
  * filename if it's complete. On failure, prints an error message to stderr
@@ -95,7 +65,8 @@ mark_file_as_archived(const char *basedir, const char *fname)
 static bool
 close_walfile(StreamCtl *stream, XLogRecPtr pos)
 {
-	off_t		currpos;
+	if (lsnfile != NULL)
+		fclose(lsnfile);
 
 	if (walfile == -1)
 		return true;
@@ -108,141 +79,9 @@ close_walfile(StreamCtl *stream, XLogRecPtr pos)
 		return false;
 	}
 	walfile = -1;
+	lsnfile = NULL;
 
 	lastFlushPosition = pos;
-	return true;
-}
-
-
-/*
- * Check if a timeline history file exists.
- */
-static bool
-existsTimeLineHistoryFile(StreamCtl *stream)
-{
-	char		path[MAXPGPATH];
-	char		histfname[MAXFNAMELEN];
-	int			fd;
-
-	/*
-	 * Timeline 1 never has a history file. We treat that as if it existed,
-	 * since we never need to stream it.
-	 */
-	if (stream->timeline == 1)
-		return true;
-
-	TLHistoryFileName(histfname, stream->timeline);
-
-	snprintf(path, sizeof(path), "%s/%s", stream->basedir, histfname);
-
-	fd = open(path, O_RDONLY | PG_BINARY, 0);
-	if (fd < 0)
-	{
-		if (errno != ENOENT)
-			fprintf(stderr, _("%s: could not open timeline history file \"%s\": %s\n"),
-					progname, path, strerror(errno));
-		return false;
-	}
-	else
-	{
-		close(fd);
-		return true;
-	}
-}
-
-static bool
-writeTimeLineHistoryFile(StreamCtl *stream, char *filename, char *content)
-{
-	int			size = strlen(content);
-	char		path[MAXPGPATH];
-	char		tmppath[MAXPGPATH];
-	char		histfname[MAXFNAMELEN];
-	int			fd;
-
-	/*
-	 * Check that the server's idea of how timeline history files should be
-	 * named matches ours.
-	 */
-	TLHistoryFileName(histfname, stream->timeline);
-	if (strcmp(histfname, filename) != 0)
-	{
-		fprintf(stderr, _("%s: server reported unexpected history file name for timeline %u: %s\n"),
-				progname, stream->timeline, filename);
-		return false;
-	}
-
-	snprintf(path, sizeof(path), "%s/%s", stream->basedir, histfname);
-
-	/*
-	 * Write into a temp file name.
-	 */
-	snprintf(tmppath, MAXPGPATH, "%s.tmp", path);
-
-	unlink(tmppath);
-
-	fd = open(tmppath, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
-	if (fd < 0)
-	{
-		fprintf(stderr, _("%s: could not create timeline history file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-		return false;
-	}
-
-	errno = 0;
-	if ((int) write(fd, content, size) != size)
-	{
-		int			save_errno = errno;
-
-		/*
-		 * If we fail to make the file, delete it to release disk space
-		 */
-		close(fd);
-		unlink(tmppath);
-
-		/* if write didn't set errno, assume problem is no disk space */
-		errno = save_errno ? save_errno : ENOSPC;
-
-		fprintf(stderr, _("%s: could not write timeline history file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-		return false;
-	}
-
-	if (fsync(fd) != 0)
-	{
-		int			save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-		return false;
-	}
-
-	if (close(fd) != 0)
-	{
-		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-				progname, tmppath, strerror(errno));
-		return false;
-	}
-
-	/*
-	 * Now move the completed history file into place with its final name.
-	 */
-	if (rename(tmppath, path) < 0)
-	{
-		fprintf(stderr, _("%s: could not rename file \"%s\" to \"%s\": %s\n"),
-				progname, tmppath, path, strerror(errno));
-		return false;
-	}
-
-	/* Maintain archive_status, check close_walfile() for details. */
-	if (stream->mark_done)
-	{
-		/* writes error message if failed */
-		if (!mark_file_as_archived(stream->basedir, histfname))
-			return false;
-	}
-
 	return true;
 }
 
@@ -442,48 +281,12 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	 * responsibility that that's sane.
 	 */
 	lastFlushPosition = stream->startpos;
-
-	// Creating the named file(FIFO)
-	mkfifo(mypipename, 0666);
+//
+//	// Creating the named file(FIFO)
+//	mkfifo(mypipename, 0666);
 
 	while (1)
 	{
-//		/*
-//		 * Fetch the timeline history file for this timeline, if we don't have
-//		 * it already.
-//		 */
-//		if (!existsTimeLineHistoryFile(stream))
-//		{
-//			snprintf(query, sizeof(query), "TIMELINE_HISTORY %u", stream->timeline);
-//			res = PQexec(conn, query);
-//			if (PQresultStatus(res) != PGRES_TUPLES_OK)
-//			{
-//				/* FIXME: we might send it ok, but get an error */
-//				fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
-//					progname, "TIMELINE_HISTORY", PQresultErrorMessage(res));
-//				PQclear(res);
-//				return false;
-//			}
-//
-//			/*
-//			 * The response to TIMELINE_HISTORY is a single row result set
-//			 * with two fields: filename and content
-//			 */
-//			if (PQnfields(res) != 2 || PQntuples(res) != 1)
-//			{
-//				fprintf(stderr,
-//						_("%s: unexpected response to TIMELINE_HISTORY command: got %d rows and %d fields, expected %d rows and %d fields\n"),
-//						progname, PQntuples(res), PQnfields(res), 1, 2);
-//			}
-//
-//			/* Write the history file to disk */
-//			writeTimeLineHistoryFile(stream,
-//									 PQgetvalue(res, 0, 0),
-//									 PQgetvalue(res, 0, 1));
-//
-//			PQclear(res);
-//		}
-
 		/*
 		 * Before we start streaming from the requested location, check if the
 		 * callback tells us to stop here.
@@ -970,7 +773,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	int			bytes_left;
 	int			bytes_written;
 	int			hdr_len;
-
+	int         iteration_count;
 	/*
 	 * Once we've decided we don't want to receive any more, just ignore any
 	 * subsequent XLogData messages.
@@ -995,67 +798,23 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	}
 	*blockpos = fe_recvint64(&copybuf[1]);
 
-	/* Extract WAL location for this block */
-//	xlogoff = *blockpos % XLOG_SEG_SIZE;
-
-	/*
-	 * Verify that the initial location in the stream matches where we think
-	 * we are.
-	 */
-//	if (walfile == -1)
-//	{
-//		/* No file open yet */
-//		if (xlogoff != 0)
-//		{
-//			fprintf(stderr,
-//					_("%s: received transaction log record for offset %u with no file open\n"),
-//					progname, xlogoff);
-//			return false;
-//		}
-//	}
-//	else
-//	{
-//		/* More data in existing segment */
-//		/* XXX: store seek value don't reseek all the time */
-//		if (lseek(walfile, 0, SEEK_CUR) != xlogoff)
-//		{
-//			fprintf(stderr,
-//					_("%s: got WAL data offset %08x, expected %08x\n"),
-//					progname, xlogoff, (int) lseek(walfile, 0, SEEK_CUR));
-//			return false;
-//		}
-//	}
-
 	bytes_left = len - hdr_len;
 	bytes_written = 0;
+	iteration_count = 0;
 
 	while (bytes_left)
 	{
 		int			bytes_to_write;
 
-		/*
-		 * If crossing a WAL boundary, only write up until we reach
-		 * XLOG_SEG_SIZE.
-		 */
-//		if (xlogoff + bytes_left > XLOG_SEG_SIZE)
-//			bytes_to_write = XLOG_SEG_SIZE - xlogoff;
-//		else
-			bytes_to_write = bytes_left;
+		bytes_to_write = bytes_left;
 
 		if (walfile == -1)
 		{
-//			if (!open_walfile(stream, *blockpos))
-//			{
-//				/* Error logged by open_walfile */
-//				return false;
-//			}
-//			walfile = open(mypipename, O_WRONLY);
 			walfile = open(mypipename, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
 		}
 
-		fprintf(stderr,
-		        _("%s: wrote %u bytes to WAL file \"%s\"\n"),
-		        progname, bytes_to_write, mypipename);
+		if (lsnfile == NULL)
+			lsnfile = fopen(lsnfile_name, "w");
 
 		if (write(walfile,
 				  copybuf + hdr_len + bytes_written,
@@ -1069,6 +828,17 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		}
 
 		/* Write was successful, advance our position */
+		XLogRecPtr lsn = fe_recvint64(&copybuf[9]);
+
+		fprintf(stderr,
+		        _("%s: wrote %u bytes to WAL file \"%s\": block pos: %u, start lsn: %u, end lsn: %u, iteration: %d\n"),
+		        progname, bytes_to_write, mypipename, *blockpos, fe_recvint64(&copybuf[1]), fe_recvint64(&copybuf[9]), iteration_count);
+
+
+		// Record last lsn
+		fprintf(lsnfile, "%lu", lsn);
+		fsync(lsnfile);
+
 		bytes_written += bytes_to_write;
 		bytes_left -= bytes_to_write;
 		*blockpos += bytes_to_write;

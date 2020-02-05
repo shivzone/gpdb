@@ -41,11 +41,9 @@ static bool do_create_slot = false;
 static bool slot_exists_ok = false;
 static bool do_drop_slot = false;
 static bool synchronous = false;
-
+static FILE *lsnfile = NULL;
 
 static void usage(void);
-static DIR *get_destination_dir(char *dest_folder);
-static void close_destination_dir(DIR *dest_dir, char *dest_folder);
 static XLogRecPtr FindStreamingStart(uint32 *tli);
 static void StreamLog(void);
 static bool stop_streaming(XLogRecPtr segendpos, uint32 timeline,
@@ -126,44 +124,6 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 	return false;
 }
 
-
-/*
- * Get destination directory.
- */
-static DIR *
-get_destination_dir(char *dest_folder)
-{
-	DIR		   *dir;
-
-	Assert(dest_folder != NULL);
-	dir = opendir(dest_folder);
-	if (dir == NULL)
-	{
-		fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"),
-				progname, basedir, strerror(errno));
-		disconnect_and_exit(1);
-	}
-
-	return dir;
-}
-
-
-/*
- * Close existing directory.
- */
-static void
-close_destination_dir(DIR *dest_dir, char *dest_folder)
-{
-	Assert(dest_dir != NULL && dest_folder != NULL);
-	if (closedir(dest_dir))
-	{
-		fprintf(stderr, _("%s: could not close directory \"%s\": %s\n"),
-				progname, dest_folder, strerror(errno));
-		disconnect_and_exit(1);
-	}
-}
-
-
 /*
  * Determine starting location for streaming, based on any existing xlog
  * segments in the directory. We start at the end of the last one that is
@@ -174,7 +134,20 @@ close_destination_dir(DIR *dest_dir, char *dest_folder)
 static XLogRecPtr
 FindStreamingStart(uint32 *tli)
 {
-	return InvalidXLogRecPtr;
+	XLogRecPtr lsn;
+	char lastLSNFile[13] = "/tmp/lastLSN";
+	int ret = 0;
+
+	if(lsnfile == NULL) {
+		lsnfile = fopen(lastLSNFile, "r");
+		if (lsnfile == NULL)
+			return InvalidXLogRecPtr;
+	}
+	ret = fscanf(lsnfile, "%lu", &lsn);
+	if(ret == 0)
+		return InvalidXLogRecPtr;
+	else
+		return lsn;
 }
 
 /*
