@@ -39,7 +39,7 @@ typedef struct StreamCtl
 
 	stream_stop_callback stream_stop;	/* Stop streaming when returns true */
 
-	char	   *basedir;		/* Received segments written to this dir */
+	char	   *destination;		/* Received segments written to this dir */
 	char	   *partial_suffix; /* Suffix appended to partially received files */
 } StreamCtl;
 

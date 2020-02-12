@@ -391,8 +391,7 @@ LogStreamerMain(logstreamer_param *param)
 	stream.standby_message_timeout = standby_message_timeout;
 	stream.synchronous = false;
 	stream.mark_done = true;
-	stream.basedir = param->xlogdir;
-	stream.partial_suffix = NULL;
+	stream.destination = param->xlogdir;
 
 	if (!ReceiveXlogStream(param->bgconn, &stream))
 
@@ -457,7 +456,7 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier)
 
 	/*
 	 * Create pg_xlog/archive_status (and thus pg_xlog) so we can write to
-	 * basedir/pg_xlog as the directory entry in the tar file may arrive
+	 * destination/pg_xlog as the directory entry in the tar file may arrive
 	 * later.
 	 */
 	snprintf(statusdir, sizeof(statusdir), "%s/pg_xlog/archive_status",
@@ -1667,7 +1666,7 @@ GenerateRecoveryConf(PGconn *conn)
 
 
 /*
- * Write a recovery.conf file into the directory specified in basedir,
+ * Write a recovery.conf file into the directory specified in destination,
  * with the contents already collected in memory.
  */
 static void

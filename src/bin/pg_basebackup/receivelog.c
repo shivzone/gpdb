@@ -29,9 +29,7 @@
 
 
 /* fd and filename for currently open WAL file */
-static int	walfile = -1;
-static char mypipename[12] = "/tmp/myfifo";
-static char current_walfile_name[MAXPGPATH] = "";
+static int	dest_handle = -1;
 static FILE *lsnfile = NULL;
 static char lsnfile_name[13] = "/tmp/lastLSN";
 static bool reportFlushPosition = false;
@@ -58,30 +56,58 @@ static bool ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos,
 						 uint32 *timeline);
 
 /*
- * Close the current WAL file (if open), and rename it to the correct
- * filename if it's complete. On failure, prints an error message to stderr
+ * Close the destination (if open) along with the resume lsn file
+ * On failure, prints an error message to stderr
  * and returns false, otherwise returns true.
  */
 static bool
-close_walfile(StreamCtl *stream, XLogRecPtr pos)
+close_destination(StreamCtl *stream, XLogRecPtr pos)
 {
+	fprintf(stderr, "closing destination");
 	if (lsnfile != NULL)
+	{
 		fclose(lsnfile);
+		lsnfile = NULL;
+	}
 
-	if (walfile == -1)
+	if (dest_handle == -1)
 		return true;
 
-	if (close(walfile) != 0)
+	if (close(dest_handle) != 0)
 	{
 		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-				progname, current_walfile_name, strerror(errno));
-		walfile = -1;
+				progname, stream->destination, strerror(errno));
+		dest_handle = -1;
 		return false;
 	}
-	walfile = -1;
-	lsnfile = NULL;
+	dest_handle = -1;
 
 	lastFlushPosition = pos;
+	return true;
+}
+
+/*
+ * Open the destination (if open) along with the resume lsn file
+ * On failure, prints an error message to stderr
+ * and returns false, otherwise returns true.
+ */
+static bool
+open_destination(StreamCtl *stream)
+{
+	fprintf(stderr, "opening destination");
+
+	// Open the lsn file
+	if (lsnfile == NULL)
+		lsnfile = fopen(lsnfile_name, "w");
+
+	// Open the stream destination
+	if ((dest_handle = open(stream->destination, O_WRONLY, PG_BINARY)) == -1)
+	{
+		fprintf(stderr,
+				_("%s: can not open stream destination  \"%s\": %s\n"),
+				progname, stream->destination, strerror(errno));
+		return false;
+	}
 	return true;
 }
 
@@ -175,7 +201,7 @@ CheckServerVersionForStreaming(PGconn *conn)
  * (by sending an extra IDENTIFY_SYSTEM command)
  *
  * All received segments will be written to the directory
- * specified by basedir. This will also fetch any missing timeline history
+ * specified by destination. This will also fetch any missing timeline history
  * files.
  *
  * The stream_stop callback will be called every time data
@@ -281,9 +307,6 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	 * responsibility that that's sane.
 	 */
 	lastFlushPosition = stream->startpos;
-//
-//	// Creating the named file(FIFO)
-//	mkfifo(mypipename, 0666);
 
 	while (1)
 	{
@@ -412,10 +435,10 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	}
 
 error:
-	if (walfile != -1 && close(walfile) != 0)
+	if (dest_handle != -1 && close(dest_handle) != 0)
 		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-				progname, current_walfile_name, strerror(errno));
-	walfile = -1;
+				progname, stream->destination, strerror(errno));
+	dest_handle = -1;
 	return false;
 }
 
@@ -499,14 +522,8 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 		 * If synchronous option is true, issue sync command as soon as there
 		 * are WAL data which has not been flushed yet.
 		 */
-		if (stream->synchronous && lastFlushPosition < blockpos && walfile != -1)
+		if (stream->synchronous && lastFlushPosition < blockpos && dest_handle != -1)
 		{
-			if (fsync(walfile) != 0)
-			{
-				fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
-						progname, current_walfile_name, strerror(errno));
-				goto error;
-			}
 			lastFlushPosition = blockpos;
 
 			/*
@@ -735,21 +752,8 @@ ProcessKeepaliveMsg(PGconn *conn, char *copybuf, int len,
 	if (replyRequested && still_sending)
 	{
 		if (reportFlushPosition && lastFlushPosition < blockpos &&
-			walfile != -1)
+			dest_handle != -1)
 		{
-			/*
-			 * If a valid flush location needs to be reported, flush the
-			 * current WAL file so that the latest flush location is sent back
-			 * to the server. This is necessary to see whether the last WAL
-			 * data has been successfully replicated or not, at the normal
-			 * shutdown of the server.
-			 */
-			if (fsync(walfile) != 0)
-			{
-				fprintf(stderr, _("%s: could not fsync file \"%s\": %s\n"),
-						progname, current_walfile_name, strerror(errno));
-				return false;
-			}
 			lastFlushPosition = blockpos;
 		}
 
@@ -769,11 +773,10 @@ static bool
 ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 				   XLogRecPtr *blockpos)
 {
-//	int			xlogoff;
-	int			bytes_left;
-	int			bytes_written;
+	int			bytes_to_write;
 	int			hdr_len;
-	int         iteration_count;
+	XLogRecPtr 	resume_lsn = InvalidXLogRecPtr;
+
 	/*
 	 * Once we've decided we don't want to receive any more, just ignore any
 	 * subsequent XLogData messages.
@@ -797,69 +800,32 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		return false;
 	}
 	*blockpos = fe_recvint64(&copybuf[1]);
+	bytes_to_write = len - hdr_len;
 
-	bytes_left = len - hdr_len;
-	bytes_written = 0;
-	iteration_count = 0;
-
-	while (bytes_left)
+	// Open the data pipe
+	if(dest_handle == -1)
 	{
-		int			bytes_to_write;
-
-		bytes_to_write = bytes_left;
-
-		if (walfile == -1)
-		{
-			walfile = open(mypipename, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
-		}
-
-		if (lsnfile == NULL)
-			lsnfile = fopen(lsnfile_name, "w");
-
-		if (write(walfile,
-				  copybuf + hdr_len + bytes_written,
-				  bytes_to_write) != bytes_to_write)
-		{
-			fprintf(stderr,
-				  _("%s: could not write %u bytes to WAL file \"%s\": %s\n"),
-					progname, bytes_to_write, current_walfile_name,
-					strerror(errno));
-			return false;
-		}
-
-		/* Write was successful, advance our position */
-		XLogRecPtr lsn = fe_recvint64(&copybuf[9]);
-
-		fprintf(stderr,
-		        _("%s: wrote %u bytes to WAL file \"%s\": block pos: %u, start lsn: %u, end lsn: %u, iteration: %d\n"),
-		        progname, bytes_to_write, mypipename, *blockpos, fe_recvint64(&copybuf[1]), fe_recvint64(&copybuf[9]), iteration_count);
-
-
-		// Record last lsn
-		fprintf(lsnfile, "%lu", lsn);
-		fsync(lsnfile);
-
-		bytes_written += bytes_to_write;
-		bytes_left -= bytes_to_write;
-		*blockpos += bytes_to_write;
-
-		/* Did we reach the end of a WAL segment? */
-		if (*blockpos % XLOG_SEG_SIZE == 0)
-		{
-			if (still_sending && stream->stream_stop(*blockpos, stream->timeline, true))
-			{
-				if (PQputCopyEnd(conn, NULL) <= 0 || PQflush(conn))
-				{
-					fprintf(stderr, _("%s: could not send copy-end packet: %s"),
-							progname, PQerrorMessage(conn));
-					return false;
-				}
-				still_sending = false;
-				return true;	/* ignore the rest of this XLogData packet */
-			}
-		}
+		open_destination(stream);
 	}
-	/* No more data left to write, receive next copy packet */
+
+	if (write(dest_handle, copybuf + hdr_len, bytes_to_write) != bytes_to_write)
+	{
+		fprintf(stderr,
+		_("%s: could not write %u bytes to pipe \"%s\": %s\n"),
+		progname, bytes_to_write, stream->destination,
+		strerror(errno));
+		return false;
+	}
+
+	resume_lsn = *blockpos + bytes_to_write;
+	fprintf(stderr,
+			_("%s: wrote %u bytes to WAL file \"%s\": block pos: %u, start lsn: %u, next lsn: %u\n"),
+			progname, bytes_to_write, stream->destination, *blockpos, fe_recvint64(&copybuf[1]), resume_lsn);
+
+	// Update resume lsn
+	// TODO: record the timeline as well. In the absence of recording timeline it assumes 1
+	fseek(lsnfile, 0, SEEK_SET);
+	fprintf(lsnfile, "%lu", resume_lsn);
 
 	return true;
 }
@@ -880,9 +846,9 @@ HandleEndOfCopyStream(PGconn *conn, StreamCtl *stream, char *copybuf,
 	 */
 	if (still_sending)
 	{
-		if (!close_walfile(stream, blockpos))
+		if (!close_destination(stream, blockpos))
 		{
-			/* Error message written in close_walfile() */
+			/* Error message written in close_destination() */
 			PQclear(res);
 			return NULL;
 		}
@@ -915,9 +881,9 @@ CheckCopyStreamStop(PGconn *conn, StreamCtl *stream, XLogRecPtr blockpos,
 {
 	if (still_sending && stream->stream_stop(blockpos, stream->timeline, false))
 	{
-		if (!close_walfile(stream, blockpos))
+		if (!close_destination(stream, blockpos))
 		{
-			/* Potential error message is written by close_walfile */
+			/* Potential error message is written by close_destination */
 			return false;
 		}
 		if (PQputCopyEnd(conn, NULL) <= 0 || PQflush(conn))

@@ -32,7 +32,7 @@
 #define RECONNECT_SLEEP_TIME 5
 
 /* Global options */
-static char *basedir = NULL;
+static char *destination = NULL;
 static int	verbose = 0;
 static int	noloop = 0;
 static int	standby_message_timeout = 10 * 1000;		/* 10 sec = default */
@@ -64,7 +64,7 @@ usage(void)
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
 	printf(_("\nOptions:\n"));
-	printf(_("  -D, --directory=DIR    receive transaction log files into this directory\n"));
+	printf(_("  -D, --destination      receive transaction log files into this destination\n"));
 	printf(_("      --if-not-exists    do not error if slot already exists when creating a slot\n"));
 	printf(_("  -n, --no-loop          do not loop on connection lost\n"));
 	printf(_("  -s, --status-interval=SECS\n"
@@ -195,14 +195,15 @@ StreamLog(void)
 	stream.startpos = FindStreamingStart(&stream.timeline);
 	if (stream.startpos == InvalidXLogRecPtr)
 	{
-		stream.startpos = serverpos;
+		stream.startpos = serverpos - serverpos % XLOG_SEG_SIZE;
 		stream.timeline = servertli;
 	}
-
-	/*
-	 * Always start streaming at the beginning of a segment
-	 */
-	stream.startpos -= stream.startpos % XLOG_SEG_SIZE;
+	else
+	{
+		// TOOD: Temporary hack that always defaults to servertli.
+		// We will need to record the timeline as well.
+		stream.timeline = servertli;
+	}
 
 	/*
 	 * Start the replication
@@ -217,8 +218,7 @@ StreamLog(void)
 	stream.standby_message_timeout = standby_message_timeout;
 	stream.synchronous = synchronous;
 	stream.mark_done = false;
-	stream.basedir = basedir;
-	stream.partial_suffix = ".partial";
+	stream.destination = destination;
 
 	ReceiveXlogStream(conn, &stream);
 
@@ -245,7 +245,7 @@ main(int argc, char **argv)
 	static struct option long_options[] = {
 		{"help", no_argument, NULL, '?'},
 		{"version", no_argument, NULL, 'V'},
-		{"directory", required_argument, NULL, 'D'},
+		{"destination", required_argument, NULL, 'D'},
 		{"dbname", required_argument, NULL, 'd'},
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
@@ -292,7 +292,7 @@ main(int argc, char **argv)
 		switch (c)
 		{
 			case 'D':
-				basedir = pg_strdup(optarg);
+				destination = pg_strdup(optarg);
 				break;
 			case 'd':
 				connection_string = pg_strdup(optarg);
@@ -457,7 +457,6 @@ main(int argc, char **argv)
 	 * Don't close the connection here so that subsequent StreamLog() can
 	 * reuse it.
 	 */
-
 	while (true)
 	{
 		StreamLog();
