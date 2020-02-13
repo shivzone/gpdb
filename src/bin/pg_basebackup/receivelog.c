@@ -31,7 +31,7 @@
 /* fd and filename for currently open WAL file */
 static int	dest_handle = -1;
 static FILE *lsnfile = NULL;
-static char lsnfile_name[13] = "/tmp/lastLSN";
+static char *lsnfile_name = NULL;
 static bool reportFlushPosition = false;
 static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
 
@@ -87,18 +87,19 @@ close_destination(StreamCtl *stream, XLogRecPtr pos)
 }
 
 /*
- * Open the destination (if open) along with the resume lsn file
+ * Open the destination (if not open) along with the resume lsn file
  * On failure, prints an error message to stderr
  * and returns false, otherwise returns true.
  */
 static bool
 open_destination(StreamCtl *stream)
 {
-	fprintf(stderr, "opening destination");
-
 	// Open the lsn file
 	if (lsnfile == NULL)
+	{
+		lsnfile_name = psprintf("%s.lsn", stream->destination);
 		lsnfile = fopen(lsnfile_name, "w");
+	}
 
 	// Open the stream destination
 	if ((dest_handle = open(stream->destination, O_WRONLY, PG_BINARY)) == -1)

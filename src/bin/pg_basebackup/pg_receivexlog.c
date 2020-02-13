@@ -125,21 +125,22 @@ stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 }
 
 /*
- * Determine starting location for streaming, based on any existing xlog
- * segments in the directory. We start at the end of the last one that is
- * complete (size matches XLogSegSize), on the timeline with highest ID.
+ * Determine starting location for streaming, based on the LSN recorded
+ * in the <destination>.lsn file
  *
- * If there are no WAL files in the directory, returns InvalidXLogRecPtr.
+ * If there are no recorded LSN, returns InvalidXLogRecPtr.
  */
 static XLogRecPtr
 FindStreamingStart(uint32 *tli)
 {
+	// TODO: We will need to fetch timeline as well in the future
 	XLogRecPtr lsn;
-	char lastLSNFile[13] = "/tmp/lastLSN";
 	int ret = 0;
+	char *lsnfile_name = NULL;
 
 	if(lsnfile == NULL) {
-		lsnfile = fopen(lastLSNFile, "r");
+		lsnfile_name = psprintf("%s.lsn", destination);
+		lsnfile = fopen(lsnfile_name, "r");
 		if (lsnfile == NULL)
 			return InvalidXLogRecPtr;
 	}
