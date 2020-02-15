@@ -17,7 +17,9 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
+CPPFLAGS += -lrdkafka
 LDFLAGS_INTERNAL += $(libpq_pgport)
+LDFLAGS_INTERNAL += -lrdkafka
 
 OBJS=receivelog.o streamutil.o $(WIN32RES)
 

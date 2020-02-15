@@ -27,13 +27,18 @@
 #include "libpq-fe.h"
 #include "access/xlog_internal.h"
 
+#include <librdkafka/rdkafka.h>
+
 
 /* fd and filename for currently open WAL file */
-static int	dest_handle = -1;
 static FILE *lsnfile = NULL;
 static char *lsnfile_name = NULL;
 static bool reportFlushPosition = false;
 static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
+
+/* kafka variables */
+static rd_kafka_t *kafka_handle; /* Producer instance handle */
+static rd_kafka_topic_t *kafka_topic; /* Topic object */
 
 static bool still_sending = true;		/* feedback still needs to be sent? */
 
@@ -55,6 +60,9 @@ static long CalculateCopyStreamSleeptime(int64 now, int standby_message_timeout,
 static bool ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos,
 						 uint32 *timeline);
 
+static void dr_msg_cb (rd_kafka_t *rk,
+					   const rd_kafka_message_t *rkmessage, void *opaque);
+
 /*
  * Close the destination (if open) along with the resume lsn file
  * On failure, prints an error message to stderr
@@ -63,26 +71,22 @@ static bool ReadEndOfStreamingResult(PGresult *res, XLogRecPtr *startpos,
 static bool
 close_destination(StreamCtl *stream, XLogRecPtr pos)
 {
-	fprintf(stderr, "closing destination");
 	if (lsnfile != NULL)
 	{
 		fclose(lsnfile);
 		lsnfile = NULL;
 	}
 
-	if (dest_handle == -1)
+	if(!kafka_handle)
 		return true;
 
-	if (close(dest_handle) != 0)
-	{
-		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-				progname, stream->destination, strerror(errno));
-		dest_handle = -1;
-		return false;
-	}
-	dest_handle = -1;
+	rd_kafka_topic_destroy(kafka_topic);
+	rd_kafka_destroy(kafka_handle);
 
 	lastFlushPosition = pos;
+
+	fprintf(stderr, "Closed kafka topic: %s\n", stream->destination);
+
 	return true;
 }
 
@@ -101,14 +105,139 @@ open_destination(StreamCtl *stream)
 		lsnfile = fopen(lsnfile_name, "w");
 	}
 
-	// Open the stream destination
-	if ((dest_handle = open(stream->destination, O_WRONLY, PG_BINARY)) == -1)
+	/* Kafka test start. */
+	rd_kafka_conf_t *conf; /* Temporary configuration object */
+	char errstr[512]; /* librdkafka API error reporting buffer */
+	const char *brokers;    /* Argument: broker list */
+	const char *topic; /* Argument: topic to produce to */
+
+	brokers = "localhost:9092";
+	topic = stream->destination;
+
+	conf = rd_kafka_conf_new();
+
+	/* Set bootstrap broker(s) as a comma-separated list of
+	 * host or host:port (default port 9092).
+	 * librdkafka will use the bootstrap brokers to acquire the full
+	 * set of brokers from the cluster. */
+	if (rd_kafka_conf_set(conf, "bootstrap.servers", brokers,
+						  errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK)
 	{
-		fprintf(stderr,
-				_("%s: can not open stream destination  \"%s\": %s\n"),
-				progname, stream->destination, strerror(errno));
+		fprintf(stderr, "%s\n", errstr);
 		return false;
 	}
+
+	/* Set the delivery report callback.
+	 * This callback will be called once per message to inform
+	 * the application if delivery succeeded or failed.
+	 * See dr_msg_cb() above. */
+	rd_kafka_conf_set_dr_msg_cb(conf, dr_msg_cb);
+
+	/*
+	 * Create producer instance.
+	 *
+	 * NOTE: rd_kafka_new() takes ownership of the conf object
+	 *       and the application must not reference it again after
+	 *       this call.
+	 */
+	kafka_handle = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+	if (!kafka_handle)
+	{
+		fprintf(stderr,
+				"%% Failed to create new producer: %s\n", errstr);
+		return false;
+	}
+	fprintf(stderr, "Created kafka handle\n");
+
+	/* Create topic object that will be reused for each message
+	 * produced.Message delivery failed
+	 *
+	 *
+	 *
+	 * Both the producer instance (rd_kafka_t) and topic objects (topic_t)
+	 * are long-lived objects that should be reused as much as possible.
+	 */
+	kafka_topic = rd_kafka_topic_new(kafka_handle, topic, NULL);
+	if (!kafka_topic)
+	{
+		fprintf(stderr, "%% Failed to create topic object: %s\n",
+				rd_kafka_err2str(rd_kafka_last_error()));
+		rd_kafka_destroy(kafka_handle);
+		return false;
+	}
+
+	fprintf(stderr, "Created kafka topic: %s\n", topic);
+	return true;
+}
+
+static bool
+write_destination(StreamCtl *stream, char *copybuf, int bytes_to_write) {
+
+	retry:
+	if (rd_kafka_produce(
+		/* Topic object */
+		kafka_topic,
+		/* Use builtin partitioner to select partition*/
+		RD_KAFKA_PARTITION_UA,
+		/* Make a copy of the payload. */
+		RD_KAFKA_MSG_F_COPY,
+		/* Message payload (value) and length */
+		copybuf + 25, bytes_to_write,
+		/* Optional key and its length */
+		NULL, 0,
+		/* Message opaque, provided in
+		 * delivery report callback as
+		 * msg_opaque. */
+		NULL) == -1)
+	{
+		/**
+		 * Failed to *enqueue* message for producing.
+		 */
+		fprintf(stderr,
+				"%% Failed to produce to topic %s: %s\n",
+				rd_kafka_topic_name(kafka_topic),
+				rd_kafka_err2str(rd_kafka_last_error()));
+
+		/* Poll to handle delivery reports */
+		if (rd_kafka_last_error() ==
+			RD_KAFKA_RESP_ERR__QUEUE_FULL)
+		{
+			/* If the internal queue is full, wait for
+			 * messages to be delivered and then retry.
+			 * The internal queue represents both
+			 * messages to be sent and messages that have
+			 * been sent or failed, awaiting their
+			 * delivery report callback to be called.
+			 *
+			 * The internal queue is limited by the
+			 * configuration property
+			 * queue.buffering.max.messages */
+			rd_kafka_poll(kafka_handle, 1000/*block for max 1000ms*/);
+			goto retry;
+		}
+	}
+	else
+	{
+		fprintf(stderr, "%% Enqueued message (%zd bytes) "
+						"for topic %s\n",
+				bytes_to_write, rd_kafka_topic_name(kafka_topic));
+	}
+
+	/* A producer application should continually serve
+	 * the delivery report queue by calling rd_kafka_poll()
+	 * at frequent intervals.
+	 * Either put the poll call in your main loop, or in a
+	 * dedicated thread, or call it after every
+	 * rd_kafka_produce() call.
+	 * Just make sure that rd_kafka_poll() is still called
+	 * during periods where you are not producing any messages
+	 * to make sure previously produced messages have their
+	 * delivery report callback served (and any other callbacks
+	 * you register). */
+	rd_kafka_poll(kafka_handle, 0/*non-blocking*/);
+
+	rd_kafka_flush(kafka_handle, 10*1000 /* wait for max 10 seconds */);
+
 	return true;
 }
 
@@ -436,10 +565,6 @@ ReceiveXlogStream(PGconn *conn, StreamCtl *stream)
 	}
 
 error:
-	if (dest_handle != -1 && close(dest_handle) != 0)
-		fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-				progname, stream->destination, strerror(errno));
-	dest_handle = -1;
 	return false;
 }
 
@@ -523,7 +648,7 @@ HandleCopyStream(PGconn *conn, StreamCtl *stream,
 		 * If synchronous option is true, issue sync command as soon as there
 		 * are WAL data which has not been flushed yet.
 		 */
-		if (stream->synchronous && lastFlushPosition < blockpos && dest_handle != -1)
+		if (stream->synchronous && lastFlushPosition < blockpos && kafka_handle)
 		{
 			lastFlushPosition = blockpos;
 
@@ -722,6 +847,32 @@ CopyStreamReceive(PGconn *conn, long timeout, char **buffer)
 	return rawlen;
 }
 
+/**
+* @brief Message delivery report callback.
+*
+* This callback is called exactly once per message, indicating if
+* the message was succesfully delivered
+* (rkmessage->err == RD_KAFKA_RESP_ERR_NO_ERROR) or permanently
+* failed delivery (rkmessage->err != RD_KAFKA_RESP_ERR_NO_ERROR).
+*
+* The callback is triggered from rd_kafka_poll() and executes on
+* the application's thread.
+*/
+static void dr_msg_cb (rd_kafka_t *rk,
+					   const rd_kafka_message_t *rkmessage, void *opaque)
+{
+	if (rkmessage->err)
+		fprintf(stderr, "%% Message delivery failed: %s\n",
+				rd_kafka_err2str(rkmessage->err));
+	else
+		fprintf(stderr,
+				"%% Message delivered (%zd bytes, "
+				"partition %"PRId32")\n",
+				rkmessage->len, rkmessage->partition);
+
+	/* The rkmessage is destroyed automatically by librdkafka */
+}
+
 /*
  * Process the keepalive message.
  */
@@ -753,7 +904,7 @@ ProcessKeepaliveMsg(PGconn *conn, char *copybuf, int len,
 	if (replyRequested && still_sending)
 	{
 		if (reportFlushPosition && lastFlushPosition < blockpos &&
-			dest_handle != -1)
+			kafka_handle)
 		{
 			lastFlushPosition = blockpos;
 		}
@@ -804,19 +955,12 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	bytes_to_write = len - hdr_len;
 
 	// Open the data pipe
-	if(dest_handle == -1)
+	if(!kafka_handle)
 	{
 		open_destination(stream);
 	}
 
-	if (write(dest_handle, copybuf + hdr_len, bytes_to_write) != bytes_to_write)
-	{
-		fprintf(stderr,
-		_("%s: could not write %u bytes to pipe \"%s\": %s\n"),
-		progname, bytes_to_write, stream->destination,
-		strerror(errno));
-		return false;
-	}
+	write_destination(stream, copybuf, bytes_to_write);
 
 	resume_lsn = *blockpos + bytes_to_write;
 	fprintf(stderr,
