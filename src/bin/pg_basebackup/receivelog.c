@@ -777,6 +777,7 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	int			bytes_to_write;
 	int			hdr_len;
 	XLogRecPtr 	resume_lsn = InvalidXLogRecPtr;
+    char        new_hdr[16];
 
 	/*
 	 * Once we've decided we don't want to receive any more, just ignore any
@@ -808,6 +809,30 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	{
 		open_destination(stream);
 	}
+
+    memset(new_hdr, '\0', sizeof(new_hdr));
+    printf("start lsn to send: %d\n", *blockpos);
+    memcpy(new_hdr, blockpos, sizeof(blockpos));
+    printf("len to send: %d\n", bytes_to_write);
+    memcpy(new_hdr+8, &bytes_to_write, sizeof(bytes_to_write));
+
+    if (write(dest_handle, new_hdr, 16) != 16)
+    {
+        fprintf(stderr,
+        _("%s: could not write header bytes to pipe \"%s\": %s\n"),
+        progname, stream->destination,
+        strerror(errno));
+        return false;
+    }
+
+    // Write data
+//    // TODO: debug printing, remove it
+//	char debugf[100];
+//	sprintf(debugf, "/tmp/debug/sender_%llu.debug", *blockpos);
+//
+//	int debugfptr = open(debugf, O_CREAT | O_WRONLY);
+//	write(debugfptr, copybuf + hdr_len, bytes_to_write);
+//	close(debugfptr);
 
 	if (write(dest_handle, copybuf + hdr_len, bytes_to_write) != bytes_to_write)
 	{
