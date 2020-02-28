@@ -20,6 +20,7 @@ override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 CPPFLAGS += -lrdkafka
 LDFLAGS_INTERNAL += $(libpq_pgport)
 LDFLAGS_INTERNAL += -lrdkafka
+CFLAGS += -I/usr/local/Cellar/librdkafka/1.3.0/include/
 
 OBJS=receivelog.o streamutil.o $(WIN32RES)
 
