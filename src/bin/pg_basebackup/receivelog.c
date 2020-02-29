@@ -171,7 +171,7 @@ open_destination(StreamCtl *stream)
 }
 
 static bool
-write_destination(StreamCtl *stream, char *copybuf, int bytes_to_write) {
+write_destination(StreamCtl *stream, char *message, int len) {
 
 	retry:
 	if (rd_kafka_produce(
@@ -182,7 +182,7 @@ write_destination(StreamCtl *stream, char *copybuf, int bytes_to_write) {
 		/* Make a copy of the payload. */
 		RD_KAFKA_MSG_F_COPY,
 		/* Message payload (value) and length */
-		copybuf + 25, bytes_to_write,
+		message, len,
 		/* Optional key and its length */
 		NULL, 0,
 		/* Message opaque, provided in
@@ -220,7 +220,7 @@ write_destination(StreamCtl *stream, char *copybuf, int bytes_to_write) {
 	{
 		fprintf(stderr, "%% Enqueued message (%zd bytes) "
 						"for topic %s\n",
-				bytes_to_write, rd_kafka_topic_name(kafka_topic));
+				len, rd_kafka_topic_name(kafka_topic));
 	}
 
 	/* A producer application should continually serve
@@ -953,6 +953,14 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 	}
 	*blockpos = fe_recvint64(&copybuf[1]);
 	bytes_to_write = len - hdr_len;
+	char    message[16 + bytes_to_write];
+
+	memset(message, '\0', sizeof(message));
+	printf("start lsn to send: %d\n", *blockpos);
+	memcpy(message, blockpos, sizeof(blockpos));
+	printf("len to send: %d\n", bytes_to_write);
+	memcpy(message+8, &bytes_to_write, sizeof(bytes_to_write));
+	memcpy(message+16, copybuf+hdr_len, bytes_to_write);
 
 	// Open the data pipe
 	if(!kafka_handle)
@@ -960,7 +968,8 @@ ProcessXLogDataMsg(PGconn *conn, StreamCtl *stream, char *copybuf, int len,
 		open_destination(stream);
 	}
 
-	write_destination(stream, copybuf, bytes_to_write);
+
+	write_destination(stream, message, 16+bytes_to_write);
 
 	resume_lsn = *blockpos + bytes_to_write;
 	fprintf(stderr,
